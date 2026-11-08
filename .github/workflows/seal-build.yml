@@ -1,0 +1,90 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build module zip
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          # The authored workflow must not ship in the module zip; upstream has no .github of its own.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          HELPER="$RUNNER_TEMP/helper"
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$HELPER" "$OUT"
+          cd "$HELPER"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+                  panic(err)
+              }
+          }
+          EOF
+          go run . github.com/andybalholm/brotli v1.1.1 "$OUT/v1.1.1.zip" "$GITHUB_WORKSPACE"
+          unzip -l "$OUT/v1.1.1.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.1.1.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.21.x", "1.22.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Test
+        env:
+          GOTOOLCHAIN: local
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          go version
+          if [ -n "$TEST_FILTER" ]; then
+            RUN_ARGS=(-run "^(${TEST_FILTER})$")
+          else
+            RUN_ARGS=()
+          fi
+          go test -v -count=1 "${RUN_ARGS[@]}" ./... | tee "$RUNNER_TEMP/test.log"
+          awk '/^--- PASS/{p++} /^--- FAIL/{f++} /^--- SKIP/{s++} END{printf "TEST SUMMARY: passed=%d failed=%d skipped=%d\n", p, f, s}' "$RUNNER_TEMP/test.log"
